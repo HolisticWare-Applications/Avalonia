@@ -6,6 +6,7 @@ using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Avalonia.Controls;
 using Avalonia.Controls.Platform;
 using Avalonia.Threading;
 using Avalonia.UnitTests;
@@ -512,76 +513,59 @@ public partial class DispatcherTests
 
 
     [Fact]
-    public async Task DispatcherResumeContinuesOnUIThread()
+    public async Task DispatcherResumeContinuesOnCurrentThread()
     {
         using var services = new DispatcherServices(new SimpleControlledDispatcherImpl());
 
         var tokenSource = new CancellationTokenSource();
-        var workload = Dispatcher.UIThread.InvokeAsync(
+        var dispatcher = Dispatcher.CurrentDispatcher;
+
+        var workload = dispatcher.InvokeAsync(
             async () =>
             {
-                Assert.True(Dispatcher.UIThread.CheckAccess());
+                Assert.True(dispatcher.CheckAccess());
 
                 await Task.Delay(1).ConfigureAwait(false);
-                Assert.False(Dispatcher.UIThread.CheckAccess());
+                Assert.False(dispatcher.CheckAccess());
 
-                await Dispatcher.UIThread.Resume();
-                Assert.True(Dispatcher.UIThread.CheckAccess());
+                await dispatcher.Resume();
+                Assert.True(dispatcher.CheckAccess());
 
                 tokenSource.Cancel();
             });
 
-        Dispatcher.UIThread.MainLoop(tokenSource.Token);
+        dispatcher.MainLoop(tokenSource.Token);
     }
 
     [Fact]
-    public async Task DispatcherYieldContinuesOnUIThread()
+    public async Task DispatcherYieldContinuesOnCurrentThread()
     {
         using var services = new DispatcherServices(new SimpleControlledDispatcherImpl());
 
         var tokenSource = new CancellationTokenSource();
-        var workload = Dispatcher.UIThread.InvokeAsync(
+        var dispatcher = Dispatcher.CurrentDispatcher;
+
+        var workload = dispatcher.InvokeAsync(
             async () =>
             {
-                Assert.True(Dispatcher.UIThread.CheckAccess());
+                Assert.True(dispatcher.CheckAccess());
 
                 await Dispatcher.Yield();
-                Assert.True(Dispatcher.UIThread.CheckAccess());
+                Assert.True(dispatcher.CheckAccess());
 
                 tokenSource.Cancel();
             });
 
-        Dispatcher.UIThread.MainLoop(tokenSource.Token);
+        dispatcher.MainLoop(tokenSource.Token);
     }
 
     [Fact]
-    public async Task DispatcherYieldThrowsOnNonUIThread()
+    public async Task AwaitWithPriorityRunsOnCurrentThread()
     {
-        using var services = new DispatcherServices(new SimpleControlledDispatcherImpl());
-
-        var tokenSource = new CancellationTokenSource();
-        var workload = Dispatcher.UIThread.InvokeAsync(
-            async () =>
-            {
-                Assert.True(Dispatcher.UIThread.CheckAccess());
-
-                await Task.Delay(1).ConfigureAwait(false);
-                Assert.False(Dispatcher.UIThread.CheckAccess());
-                await Assert.ThrowsAsync<InvalidOperationException>(async () => await Dispatcher.Yield());
-
-                tokenSource.Cancel();
-            });
-
-        Dispatcher.UIThread.MainLoop(tokenSource.Token);
-    }
-
-    [Fact]
-    public async Task AwaitWithPriorityRunsOnUIThread()
-    {
-        static async Task<int> Workload()
+        static async Task<int> Workload(Dispatcher dispatcher)
         {
             await Task.Delay(1).ConfigureAwait(false);
-            Assert.False(Dispatcher.UIThread.CheckAccess());
+            Assert.False(dispatcher.CheckAccess());
 
             return Thread.CurrentThread.ManagedThreadId;
         }
@@ -589,30 +573,45 @@ public partial class DispatcherTests
         using var services = new DispatcherServices(new SimpleControlledDispatcherImpl());
 
         var tokenSource = new CancellationTokenSource();
-        var workload = Dispatcher.UIThread.InvokeAsync(
+        var dispatcher = Dispatcher.CurrentDispatcher;
+
+        var workload = dispatcher.InvokeAsync(
             async () =>
             {
-                Assert.True(Dispatcher.UIThread.CheckAccess());
-                Task taskWithoutResult = Workload();
+                Assert.True(dispatcher.CheckAccess());
+                Task taskWithoutResult = Workload(dispatcher);
 
-                await Dispatcher.UIThread.AwaitWithPriority(taskWithoutResult, DispatcherPriority.Default);
+                await dispatcher.AwaitWithPriority(taskWithoutResult, DispatcherPriority.Default);
 
-                Assert.True(Dispatcher.UIThread.CheckAccess());
-                Task<int> taskWithResult = Workload();
+                Assert.True(dispatcher.CheckAccess());
+                Task<int> taskWithResult = Workload(dispatcher);
 
-                await Dispatcher.UIThread.AwaitWithPriority(taskWithResult, DispatcherPriority.Default);
+                await dispatcher.AwaitWithPriority(taskWithResult, DispatcherPriority.Default);
 
-                Assert.True(Dispatcher.UIThread.CheckAccess());
+                Assert.True(dispatcher.CheckAccess());
 
                 tokenSource.Cancel();
             });
 
-        Dispatcher.UIThread.MainLoop(tokenSource.Token);
+        dispatcher.MainLoop(tokenSource.Token);
     }
 
     private class AsyncLocalTestClass
     {
         public AsyncLocal<string?> AsyncLocalField { get; set; } = new AsyncLocal<string?>();
+    }
+
+    private sealed class AsyncLocalMeasureControl(Func<string?> getValue, Action<string?> setValue) : Control
+    {
+        public bool RecordMeasure { get; set; }
+
+        protected override Size MeasureOverride(Size availableSize)
+        {
+            if (RecordMeasure)
+                setValue(getValue());
+
+            return new Size(1, 1);
+        }
     }
 
     [Fact]
@@ -709,6 +708,76 @@ public partial class DispatcherTests
 
         // Assertions
         // The value should NOT flow between different InvokeAsync execution contexts.
+        Assert.Null(test);
+    }
+
+    [Fact]
+    public void MediaContextRenderSchedulingDoesNotCaptureAmbientExecutionContext()
+    {
+        var impl = new SimpleDispatcherWithBackgroundProcessingImpl();
+        using var services = new DispatcherServices(impl);
+        Dispatcher.InitializeUIThreadDispatcher(impl);
+
+        var testObject = new AsyncLocalTestClass();
+        string? test = "Not measured";
+        var control = new AsyncLocalMeasureControl(() => testObject.AsyncLocalField.Value, value => test = value);
+        var root = new TestRoot { Child = control };
+
+        root.ExecuteInitialLayoutPass();
+        control.RecordMeasure = true;
+
+        Dispatcher.UIThread.Post(() =>
+        {
+            testObject.AsyncLocalField.Value = "Initial Value";
+            control.InvalidateMeasure();
+            testObject.AsyncLocalField.Value = null;
+        });
+
+        Assert.True(impl.AskedForSignal);
+        impl.ExecuteSignal();
+
+        Assert.Null(test);
+    }
+
+    [Fact]
+    public void MediaContextRenderSchedulingAllowsAlreadySuppressedExecutionContextFlow()
+    {
+        var impl = new SimpleDispatcherWithBackgroundProcessingImpl();
+        using var services = new DispatcherServices(impl);
+        Dispatcher.InitializeUIThreadDispatcher(impl);
+
+        var testObject = new AsyncLocalTestClass();
+        string? test = "Not measured";
+        Exception? schedulingException = null;
+        var control = new AsyncLocalMeasureControl(() => testObject.AsyncLocalField.Value, value => test = value);
+        var root = new TestRoot { Child = control };
+
+        root.ExecuteInitialLayoutPass();
+        control.RecordMeasure = true;
+
+        Dispatcher.UIThread.Post(() =>
+        {
+            testObject.AsyncLocalField.Value = "Initial Value";
+
+            try
+            {
+                using (ExecutionContext.SuppressFlow())
+                {
+                    control.InvalidateMeasure();
+                }
+            }
+            catch (Exception e)
+            {
+                schedulingException = e;
+            }
+
+            testObject.AsyncLocalField.Value = null;
+        });
+
+        Assert.True(impl.AskedForSignal);
+        impl.ExecuteSignal();
+
+        Assert.Null(schedulingException);
         Assert.Null(test);
     }
 

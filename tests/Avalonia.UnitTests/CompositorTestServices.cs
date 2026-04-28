@@ -42,9 +42,10 @@ public class CompositorTestServices : IDisposable
         _app = UnitTestApplication.Start(services);
         try
         {
-            AvaloniaLocator.CurrentMutable.Bind<IRenderTimer>().ToConstant(Timer);
+            var renderLoop = RenderLoop.FromTimer(Timer);
+            AvaloniaLocator.CurrentMutable.Bind<IRenderLoop>().ToConstant(renderLoop);
 
-            Compositor = new Compositor(new RenderLoop(Timer), null,
+            Compositor = new Compositor(renderLoop, null,
                 true, new DispatcherCompositorScheduler(), true, Dispatcher.UIThread);
             var impl = new TopLevelImpl(Compositor, size ?? new Size(1000, 1000));
             TopLevel = new EmbeddableControlRoot(impl)
@@ -136,12 +137,12 @@ public class CompositorTestServices : IDisposable
 
     public class ManualRenderTimer : IRenderTimer
     {
-        public event Action<TimeSpan>? Tick;
+        public Action<TimeSpan>? Tick { get; set; }
         public bool RunsInBackground => false;
         public void TriggerTick() => Tick?.Invoke(TimeSpan.Zero);
     }
 
-    class TopLevelImpl : ITopLevelImpl
+    public class TopLevelImpl : ITopLevelImpl
     {
         private readonly Compositor _compositor;
 
@@ -158,7 +159,7 @@ public class CompositorTestServices : IDisposable
 
         public double DesktopScaling => 1;
         public IPlatformHandle? Handle => null;
-        public Size ClientSize { get; }
+        public Size ClientSize { get; set; }
         public double RenderScaling => 1;
         public IPlatformRenderSurface[] Surfaces { get; } = [new DummyFramebufferSurface()];
         public Action<RawInputEventArgs>? Input { get; set; }
